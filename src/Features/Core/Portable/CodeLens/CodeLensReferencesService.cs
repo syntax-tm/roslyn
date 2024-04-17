@@ -2,13 +2,13 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 // See the LICENSE file in the project root for more information.
 
-#nullable disable
-
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.CodeAnalysis.FindSymbols;
@@ -40,8 +40,151 @@ internal sealed class CodeLensReferencesService : ICodeLensReferencesService
             UnidirectionalHierarchyCascade = true
         };
 
-    private static async Task<T?> FindAsync<T>(Solution solution, DocumentId documentId, SyntaxNode syntaxNode,
-        Func<CodeLensFindReferencesProgress, Task<T>> onResults, Func<CodeLensFindReferencesProgress, Task<T>> onCapped,
+    private static readonly CachedFindReferencesResults s_cachedResults = new();
+
+    private sealed class CachedFindReferencesResults
+    {
+        // TODO: Consider concurrency
+        private readonly ConditionalWeakTable<Solution, List<(DocumentId DocumentId, SyntaxNode? SyntaxNode, CodeLensFindReferencesProgress Progress)>> _previousRequestsMapping = new();
+        private readonly Object _gate = new();
+
+        public void AddResult(Solution solution, DocumentId documentId, SyntaxNode? syntaxNode, CodeLensFindReferencesProgress progress)
+        {
+            lock (_gate)
+            {
+                if (!_previousRequestsMapping.TryGetValue(solution, out var previousRequests))
+                {
+                    previousRequests = new List<(DocumentId DocumentId, SyntaxNode? SyntaxNode, CodeLensFindReferencesProgress Progress)>();
+                    _previousRequestsMapping.Add(solution, previousRequests);
+                }
+
+                previousRequests.Add((documentId, syntaxNode, progress));
+            }
+        }
+
+        public bool TryGetProgress(Solution solution, DocumentId documentId, SyntaxNode? syntaxNode, [NotNullWhen(true)] out CodeLensFindReferencesProgress? progress)
+        {
+            lock (_gate)
+            {
+                if (TryGetProgressFromSameSolution(solution, documentId, syntaxNode, out progress))
+                    return true;
+
+                if (TryGetProgressFromSameSolution(solution, documentId, syntaxNode, out progress))
+                    return true;
+            }
+
+            progress = null;
+            return false;
+        }
+
+        private bool TryGetProgressFromSameSolution(Solution solution, DocumentId documentId, SyntaxNode? syntaxNode, [NotNullWhen(true)] out CodeLensFindReferencesProgress? progress)
+        {
+            if (_previousRequestsMapping.TryGetValue(solution, out var previousRequests))
+            {
+                foreach (var result in previousRequests)
+                {
+                    if (result.DocumentId == documentId
+                        && result.SyntaxNode == syntaxNode)
+                    {
+                        progress = result.Progress;
+                        return true;
+                    }
+                }
+            }
+
+            progress = null;
+            return false;
+        }
+
+        private bool TryGetProgressFromSolutionWithOnlyDocumentChanged(Solution solution, DocumentId documentId, SyntaxNode? syntaxNode, [NotNullWhen(true)] out CodeLensFindReferencesProgress? progress)
+        {
+#if NET
+            if (TryGetCachedSolutionAndProgress(solution, documentId, syntaxNode, out var oldSolution, out var oldProgress))
+            {
+                if (oldSolution == solution
+                    || IsSingleDocumentChange(oldSolution, solution, documentId))
+                {
+                    progress = oldProgress;
+                    return true;
+                }
+            }
+
+            progress = null;
+            return false;
+
+            bool IsSingleDocumentChange(Solution oldSolution, Solution newSolution, DocumentId documentId)
+            {
+                var solutionDifferences = solution.GetChanges(oldSolution);
+                ProjectChanges? foundProjectChanges = null;
+                var foundDocument = false;
+
+                foreach (var projectChanges in solutionDifferences.GetProjectChanges())
+                {
+                    if (projectChanges.ProjectId != documentId.ProjectId)
+                        return false;
+
+                    foundProjectChanges = projectChanges;
+                    foreach (var changedDocumentId in projectChanges.GetChangedDocuments())
+                    {
+                        if (changedDocumentId != documentId)
+                            return false;
+
+                        foundDocument = true;
+                    }
+                }
+
+                if (!foundDocument || foundProjectChanges == null)
+                    return false;
+
+                if (solutionDifferences.GetAddedProjects().Any()
+                    || solutionDifferences.GetRemovedProjects().Any())
+                    return false;
+
+                // TODO: Verify no other changes in project
+                return true;
+            }
+
+            bool TryGetCachedSolutionAndProgress(
+                Solution newSolution,
+                DocumentId documentId,
+                SyntaxNode? syntaxNode,
+                [NotNullWhen(true)] out Solution? oldSolution,
+                [NotNullWhen(true)] out CodeLensFindReferencesProgress? progress)
+            {
+                oldSolution = null;
+                progress = null;
+
+                foreach (var previousRequestMapping in _previousRequestsMapping)
+                {
+                    var previousSolution = previousRequestMapping.Key;
+                    if (previousSolution.Id == newSolution.Id)
+                    {
+                        foreach (var result in previousRequestMapping.Value)
+                        {
+                            if (result.DocumentId == documentId
+                                && result.SyntaxNode == syntaxNode)
+                            {
+                                oldSolution = previousSolution;
+                                progress = result.Progress;
+
+                                return true;
+                            }
+                        }
+                    }
+                }
+
+                return false;
+            }
+#else
+            progress = null;
+            return false;
+#endif
+
+        }
+    }
+
+    private static async Task<T?> FindAsync<T>(Solution solution, DocumentId documentId, SyntaxNode? syntaxNode,
+        Func<CodeLensFindReferencesProgress, Task<T>> onResults, Func<CodeLensFindReferencesProgress, Task<T>>? onCapped,
         int searchCap, CancellationToken cancellationToken) where T : struct
     {
         var document = await solution.GetDocumentAsync(documentId, includeSourceGenerated: true, cancellationToken).ConfigureAwait(false);
@@ -50,11 +193,17 @@ internal sealed class CodeLensReferencesService : ICodeLensReferencesService
             return null;
         }
 
-        var semanticModel = await document.GetSemanticModelAsync(cancellationToken).ConfigureAwait(false);
+        if (s_cachedResults.TryGetProgress(solution, documentId, syntaxNode, out var cachedProgress))
+        {
+            return await onResults(cachedProgress).ConfigureAwait(false);
+        }
+
+        var semanticModel = await document.GetRequiredSemanticModelAsync(cancellationToken).ConfigureAwait(false);
 
         cancellationToken.ThrowIfCancellationRequested();
 
-        var symbol = semanticModel.GetDeclaredSymbol(syntaxNode, cancellationToken);
+        // TODO: Figure out nullability of SyntaxNode
+        var symbol = semanticModel.GetDeclaredSymbol(syntaxNode!, cancellationToken);
         if (symbol == null)
         {
             return null;
@@ -66,12 +215,17 @@ internal sealed class CodeLensReferencesService : ICodeLensReferencesService
             await SymbolFinder.FindReferencesAsync(
                 symbol, solution, progress, documents: null, s_nonParallelSearch, progress.CancellationToken).ConfigureAwait(false);
 
-            return await onResults(progress).ConfigureAwait(false);
+            var result = await onResults(progress).ConfigureAwait(false);
+            s_cachedResults.AddResult(solution, documentId, syntaxNode, progress);
+
+            return result;
         }
         catch (OperationCanceledException)
         {
             if (onCapped != null && progress.SearchCapReached)
             {
+                s_cachedResults.AddResult(solution, documentId, syntaxNode, progress);
+
                 // search was cancelled, and it was cancelled by us because a cap was reached.
                 return await onCapped(progress).ConfigureAwait(false);
             }
@@ -87,7 +241,7 @@ internal sealed class CodeLensReferencesService : ICodeLensReferencesService
         return await solution.GetRequiredProject(projectId).GetDependentVersionAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task<ReferenceCount?> GetReferenceCountAsync(Solution solution, DocumentId documentId, SyntaxNode syntaxNode, int maxSearchResults, CancellationToken cancellationToken)
+    public async Task<ReferenceCount?> GetReferenceCountAsync(Solution solution, DocumentId documentId, SyntaxNode? syntaxNode, int maxSearchResults, CancellationToken cancellationToken)
     {
         var projectVersion = await GetProjectCodeLensVersionAsync(solution, documentId.ProjectId, cancellationToken).ConfigureAwait(false);
         return await FindAsync(solution, documentId, syntaxNode,
@@ -99,7 +253,7 @@ internal sealed class CodeLensReferencesService : ICodeLensReferencesService
             maxSearchResults, cancellationToken).ConfigureAwait(false);
     }
 
-    private static async Task<ReferenceLocationDescriptor> GetDescriptorOfEnclosingSymbolAsync(Solution solution, Location location, CancellationToken cancellationToken)
+    private static async Task<ReferenceLocationDescriptor?> GetDescriptorOfEnclosingSymbolAsync(Solution solution, Location location, CancellationToken cancellationToken)
     {
         var document = solution.GetDocument(location.SourceTree);
 
@@ -108,7 +262,7 @@ internal sealed class CodeLensReferencesService : ICodeLensReferencesService
             return null;
         }
 
-        var semanticModel = await document.GetSemanticModelAsync(cancellationToken).ConfigureAwait(false);
+        var semanticModel = await document.GetRequiredSemanticModelAsync(cancellationToken).ConfigureAwait(false);
 
         var langServices = document.GetLanguageService<ICodeLensDisplayInfoService>();
         if (langServices == null)
@@ -117,7 +271,7 @@ internal sealed class CodeLensReferencesService : ICodeLensReferencesService
         }
 
         var position = location.SourceSpan.Start;
-        var token = (await document.GetSyntaxRootAsync(cancellationToken).ConfigureAwait(false)).FindToken(position, true);
+        var token = (await document.GetRequiredSyntaxRootAsync(cancellationToken).ConfigureAwait(false)).FindToken(position, true);
         var node = GetEnclosingCodeElementNode(document, token, langServices, cancellationToken);
         var longName = langServices.GetDisplayName(semanticModel, node);
 
@@ -146,7 +300,7 @@ internal sealed class CodeLensReferencesService : ICodeLensReferencesService
         var symbol = semanticModel.GetDeclaredSymbol(node, cancellationToken);
         var glyph = symbol?.GetGlyph();
         var startLinePosition = location.GetLineSpan().StartLinePosition;
-        var documentId = solution.GetDocument(location.SourceTree)?.Id;
+        var documentId = solution.GetRequiredDocument(location.GetSourceTreeOrThrow()).Id;
 
         return new ReferenceLocationDescriptor(
             longName,
@@ -170,7 +324,7 @@ internal sealed class CodeLensReferencesService : ICodeLensReferencesService
 
     private static SyntaxNode GetEnclosingCodeElementNode(Document document, SyntaxToken token, ICodeLensDisplayInfoService langServices, CancellationToken cancellationToken)
     {
-        var syntaxFactsService = document.GetLanguageService<ISyntaxFactsService>();
+        var syntaxFactsService = document.GetRequiredLanguageService<ISyntaxFactsService>();
 
         var node = token.Parent;
         while (node != null)
@@ -200,7 +354,7 @@ internal sealed class CodeLensReferencesService : ICodeLensReferencesService
         return langServices.GetDisplayNode(node);
     }
 
-    public async Task<ImmutableArray<ReferenceLocationDescriptor>?> FindReferenceLocationsAsync(Solution solution, DocumentId documentId, SyntaxNode syntaxNode, CancellationToken cancellationToken)
+    public async Task<ImmutableArray<ReferenceLocationDescriptor>?> FindReferenceLocationsAsync(Solution solution, DocumentId documentId, SyntaxNode? syntaxNode, CancellationToken cancellationToken)
     {
         return await FindAsync(solution, documentId, syntaxNode,
             async progress =>
@@ -215,7 +369,7 @@ internal sealed class CodeLensReferencesService : ICodeLensReferencesService
             }, onCapped: null, searchCap: 0, cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 
-    private static ISymbol GetEnclosingMethod(SemanticModel semanticModel, Location location, CancellationToken cancellationToken)
+    private static ISymbol? GetEnclosingMethod(SemanticModel semanticModel, Location location, CancellationToken cancellationToken)
     {
         var enclosingSymbol = semanticModel.GetEnclosingSymbol(location.SourceSpan.Start, cancellationToken);
 
@@ -243,7 +397,7 @@ internal sealed class CodeLensReferencesService : ICodeLensReferencesService
         return null;
     }
 
-    private static async Task<ReferenceMethodDescriptor> TryGetMethodDescriptorAsync(Location commonLocation, Solution solution, CancellationToken cancellationToken)
+    private static async Task<ReferenceMethodDescriptor?> TryGetMethodDescriptorAsync(Location commonLocation, Solution solution, CancellationToken cancellationToken)
     {
         var document = solution.GetDocument(commonLocation.SourceTree);
         if (document == null)
@@ -251,13 +405,13 @@ internal sealed class CodeLensReferencesService : ICodeLensReferencesService
             return null;
         }
 
-        var semanticModel = await document.GetSemanticModelAsync(cancellationToken).ConfigureAwait(false);
+        var semanticModel = await document.GetRequiredSemanticModelAsync(cancellationToken).ConfigureAwait(false);
         var fullName = GetEnclosingMethod(semanticModel, commonLocation, cancellationToken)?.ToDisplayString(MethodDisplayFormat);
 
         return !string.IsNullOrEmpty(fullName) ? new ReferenceMethodDescriptor(fullName, document.FilePath, document.Project.OutputFilePath) : null;
     }
 
-    public Task<ImmutableArray<ReferenceMethodDescriptor>?> FindReferenceMethodsAsync(Solution solution, DocumentId documentId, SyntaxNode syntaxNode, CancellationToken cancellationToken)
+    public Task<ImmutableArray<ReferenceMethodDescriptor>?> FindReferenceMethodsAsync(Solution solution, DocumentId documentId, SyntaxNode? syntaxNode, CancellationToken cancellationToken)
     {
         return FindAsync(solution, documentId, syntaxNode,
             async progress =>
@@ -273,12 +427,15 @@ internal sealed class CodeLensReferencesService : ICodeLensReferencesService
             }, onCapped: null, searchCap: 0, cancellationToken: cancellationToken);
     }
 
-    public async Task<string> GetFullyQualifiedNameAsync(Solution solution, DocumentId documentId, SyntaxNode syntaxNode,
+    public async Task<string?> GetFullyQualifiedNameAsync(Solution solution, DocumentId documentId, SyntaxNode? syntaxNode,
         CancellationToken cancellationToken)
     {
-        var document = solution.GetDocument(syntaxNode.GetLocation().SourceTree);
+        if (syntaxNode is null)
+            throw new ArgumentNullException(nameof(syntaxNode));
 
-        var semanticModel = await document.GetSemanticModelAsync(cancellationToken).ConfigureAwait(false);
+        var document = solution.GetRequiredDocument(syntaxNode.GetLocation().GetSourceTreeOrThrow());
+
+        var semanticModel = await document.GetRequiredSemanticModelAsync(cancellationToken).ConfigureAwait(false);
         var declaredSymbol = semanticModel.GetDeclaredSymbol(syntaxNode, cancellationToken);
 
         if (declaredSymbol == null)
